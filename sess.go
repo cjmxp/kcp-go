@@ -1,8 +1,10 @@
 package kcp
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"hash/crc32"
 	"io"
 	"net"
 	"sync"
@@ -10,9 +12,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-
-	"github.com/klauspost/crc32"
-
 	"golang.org/x/net/ipv4"
 )
 
@@ -25,22 +24,34 @@ func (errTimeout) Temporary() bool { return true }
 func (errTimeout) Error() string   { return "i/o timeout" }
 
 const (
-	defaultWndSize           = 128 // default window size, in packet
-	nonceSize                = 16  // magic number
-	crcSize                  = 4   // 4bytes packet checksum
-	cryptHeaderSize          = nonceSize + crcSize
-	mtuLimit                 = 2048
-	txQueueLimit             = 8192
-	rxFECMulti               = 3 // FEC keeps rxFECMulti* (dataShard+parityShard) ordered packets in memory
-	defaultKeepAliveInterval = 10 * time.Second
+	// 16-bytes magic number for each packet
+	nonceSize = 16
+
+	// 4-bytes packet checksum
+	crcSize = 4
+
+	// overall crypto header size
+	cryptHeaderSize = nonceSize + crcSize
+
+	// maximum packet size
+	mtuLimit = 1500
+
+	// FEC keeps rxFECMulti* (dataShard+parityShard) ordered packets in memory
+	rxFECMulti = 3
 )
 
 const (
-	errBrokenPipe = "broken pipe"
+	errBrokenPipe       = "broken pipe"
+	errInvalidOperation = "invalid operation"
 )
 
 var (
+	// global packet buffer
+	// shared among sending/receiving/FEC
 	xmitBuf sync.Pool
+
+	// monotonic session id
+	sid uint32
 )
 
 func init() {
@@ -52,25 +63,42 @@ func init() {
 type (
 	// UDPSession defines a KCP session implemented by UDP
 	UDPSession struct {
-		kcp               *KCP           // the core ARQ
-		l                 *Listener      // point to server listener if it's a server socket
-		fec               *FEC           // forward error correction
-		conn              net.PacketConn // the underlying packet socket
-		block             BlockCrypt
-		remote            net.Addr
-		rd                time.Time // read deadline
-		wd                time.Time // write deadline
-		sockbuff          []byte    // kcp receiving is based on packet, I turn it into stream
-		die               chan struct{}
-		chReadEvent       chan struct{}
-		chWriteEvent      chan struct{}
-		chTicker          chan time.Time
-		chUDPOutput       chan []byte
-		headerSize        int
-		ackNoDelay        bool
-		isClosed          bool
-		keepAliveInterval time.Duration
-		mu                sync.Mutex
+		sid   uint32         // session id(monotonic)
+		conn  net.PacketConn // the underlying packet connection
+		kcp   *KCP           // KCP ARQ protocol
+		l     *Listener      // point to the Listener if it's accepted by Listener
+		block BlockCrypt     // block encryption
+
+		// kcp receiving is based on packets
+		// recvbuf turns packets into stream
+		recvbuf []byte
+		buffer  bytes.Buffer
+		// extended output buffer(with header)
+		ext []byte
+
+		fec           *FEC     // forward error correction
+		fecDataShards [][]byte // data shards cache
+		fecShardCount int      // count the number of datashards collected
+		fecMaxSize    int      // record maximum data length in datashard
+
+		fecHeaderOffset  int // FEC header offset in packet
+		fecPayloadOffset int // FEC payload offset in packet
+
+		// settings
+		remote         net.Addr      // remote peer address
+		rd             time.Time     // read deadline
+		wd             time.Time     // write deadline
+		headerSize     int           // the overall header size added before KCP frame
+		updateInterval time.Duration // interval in seconds to call kcp.flush()
+		ackNoDelay     bool          // send ack immediately for each incoming packet
+
+		// notifications
+		die          chan struct{} // notify session has Closed
+		chReadEvent  chan struct{} // notify Read() can be called without blocking
+		chWriteEvent chan struct{} // notify Write() can be called without blocking
+
+		isClosed bool // flag the session has Closed
+		mu       sync.Mutex
 	}
 
 	setReadBuffer interface {
@@ -85,17 +113,32 @@ type (
 // newUDPSession create a new udp session for client or server
 func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn net.PacketConn, remote net.Addr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
-	sess.chTicker = make(chan time.Time, 1)
-	sess.chUDPOutput = make(chan []byte, txQueueLimit)
+	sess.sid = atomic.AddUint32(&sid, 1)
 	sess.die = make(chan struct{})
 	sess.chReadEvent = make(chan struct{}, 1)
 	sess.chWriteEvent = make(chan struct{}, 1)
 	sess.remote = remote
 	sess.conn = conn
-	sess.keepAliveInterval = defaultKeepAliveInterval
 	sess.l = l
 	sess.block = block
+	sess.recvbuf = make([]byte, mtuLimit)
+	sess.ext = make([]byte, mtuLimit)
+
+	// FEC initialization
 	sess.fec = newFEC(rxFECMulti*(dataShards+parityShards), dataShards, parityShards)
+	if sess.fec != nil {
+		if sess.block != nil {
+			sess.fecHeaderOffset = cryptHeaderSize
+		}
+		sess.fecPayloadOffset = sess.fecHeaderOffset + fecHeaderSize
+
+		// fec data shards
+		sess.fecDataShards = make([][]byte, sess.fec.shardSize)
+		for k := range sess.fecDataShards {
+			sess.fecDataShards[k] = make([]byte, mtuLimit)
+		}
+	}
+
 	// calculate header size
 	if sess.block != nil {
 		sess.headerSize += cryptHeaderSize
@@ -106,19 +149,12 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 
 	sess.kcp = NewKCP(conv, func(buf []byte, size int) {
 		if size >= IKCP_OVERHEAD {
-			ext := xmitBuf.Get().([]byte)[:sess.headerSize+size]
-			copy(ext[sess.headerSize:], buf)
-			select {
-			case sess.chUDPOutput <- ext:
-			case <-sess.die:
-			}
+			sess.output(buf[:size])
 		}
 	})
-	sess.kcp.WndSize(defaultWndSize, defaultWndSize)
 	sess.kcp.SetMtu(IKCP_MTU_DEF - sess.headerSize)
 
-	go sess.updateTask()
-	go sess.outputTask()
+	updater.addSession(sess)
 	if sess.l == nil { // it's a client connection
 		go sess.readLoop()
 		atomic.AddUint64(&DefaultSnmp.ActiveOpens, 1)
@@ -138,9 +174,8 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 func (s *UDPSession) Read(b []byte) (n int, err error) {
 	for {
 		s.mu.Lock()
-		if len(s.sockbuff) > 0 { // copy from buffer
-			n = copy(b, s.sockbuff)
-			s.sockbuff = s.sockbuff[n:]
+		if s.buffer.Len() > 0 { // copy from buffer
+			n, _ = s.buffer.Read(b)
 			s.mu.Unlock()
 			return n, nil
 		}
@@ -157,17 +192,21 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 			}
 		}
 
-		if n := s.kcp.PeekSize(); n > 0 { // data arrived
-			if len(b) >= n {
+		if size := s.kcp.PeekSize(); size > 0 { // data arrived
+			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(size))
+			if len(b) >= size { // direct write
 				s.kcp.Recv(b)
-			} else {
-				buf := make([]byte, n)
-				s.kcp.Recv(buf)
-				n = copy(b, buf)
-				s.sockbuff = buf[n:] // store remaining bytes into sockbuff for next read
+				s.mu.Unlock()
+				return size, nil
 			}
+
+			if len(s.recvbuf) < size { // resize buf
+				s.recvbuf = make([]byte, size)
+			}
+			s.kcp.Recv(s.recvbuf)
+			n = copy(b, s.recvbuf[:size])     // direct copy
+			s.buffer.Write(s.recvbuf[n:size]) // save rests to bytes.Buffer
 			s.mu.Unlock()
-			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
 			return n, nil
 		}
 
@@ -209,20 +248,19 @@ func (s *UDPSession) Write(b []byte) (n int, err error) {
 			}
 		}
 
-		if s.kcp.WaitSnd() < int(s.kcp.snd_wnd) {
+		if s.kcp.WaitSnd() < int(s.kcp.Cwnd()) {
 			n = len(b)
-			max := s.kcp.mss << 8
 			for {
-				if len(b) <= int(max) { // in most cases
+				if len(b) <= int(s.kcp.mss) {
 					s.kcp.Send(b)
 					break
 				} else {
-					s.kcp.Send(b[:max])
-					b = b[max:]
+					s.kcp.Send(b[:s.kcp.mss])
+					b = b[s.kcp.mss:]
 				}
 			}
-			s.kcp.current = currentMs()
-			s.kcp.flush()
+
+			s.kcp.flush(false)
 			s.mu.Unlock()
 			atomic.AddUint64(&DefaultSnmp.BytesSent, uint64(n))
 			return n, nil
@@ -252,6 +290,8 @@ func (s *UDPSession) Write(b []byte) (n int, err error) {
 
 // Close closes the connection.
 func (s *UDPSession) Close() error {
+	updater.removeSession(s)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.isClosed {
@@ -305,11 +345,16 @@ func (s *UDPSession) SetWindowSize(sndwnd, rcvwnd int) {
 	s.kcp.WndSize(sndwnd, rcvwnd)
 }
 
-// SetMtu sets the maximum transmission unit
-func (s *UDPSession) SetMtu(mtu int) {
+// SetMtu sets the maximum transmission unit(not including UDP header)
+func (s *UDPSession) SetMtu(mtu int) bool {
+	if mtu > mtuLimit {
+		return false
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.kcp.SetMtu(mtu - s.headerSize)
+	return true
 }
 
 // SetStreamMode toggles the stream mode on/off
@@ -335,6 +380,7 @@ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.kcp.NoDelay(nodelay, interval, resend, nc)
+	s.updateInterval = time.Duration(interval) * time.Millisecond
 }
 
 // SetDSCP sets the 6bit DSCP field of IP header, no effect if it's accepted from Listener
@@ -348,7 +394,7 @@ func (s *UDPSession) SetDSCP(dscp int) error {
 			return ipv4.NewConn(nc).SetTOS(dscp << 2)
 		}
 	}
-	return nil
+	return errors.New(errInvalidOperation)
 }
 
 // SetReadBuffer sets the socket read buffer, no effect if it's accepted from Listener
@@ -360,7 +406,7 @@ func (s *UDPSession) SetReadBuffer(bytes int) error {
 			return nc.SetReadBuffer(bytes)
 		}
 	}
-	return nil
+	return errors.New(errInvalidOperation)
 }
 
 // SetWriteBuffer sets the socket write buffer, no effect if it's accepted from Listener
@@ -372,161 +418,109 @@ func (s *UDPSession) SetWriteBuffer(bytes int) error {
 			return nc.SetWriteBuffer(bytes)
 		}
 	}
-	return nil
+	return errors.New(errInvalidOperation)
 }
 
-// SetKeepAlive changes per-connection NAT keepalive interval; 0 to disable, default to 10s
-func (s *UDPSession) SetKeepAlive(interval int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.keepAliveInterval = time.Duration(interval) * time.Second
-}
+// output pipeline entry
+// steps for output data processing:
+// 1. FEC
+// 2. CRC32
+// 3. Encryption
+// 4. WriteTo kernel
+func (s *UDPSession) output(buf []byte) {
+	var ecc [][]byte
 
-func (s *UDPSession) outputTask() {
-	// offset pre-compute
-	fecOffset := 0
-	if s.block != nil {
-		fecOffset = cryptHeaderSize
-	}
-	szOffset := fecOffset + fecHeaderSize
+	// extend buf's header space
+	ext := s.ext[:s.headerSize+len(buf)]
+	copy(ext[s.headerSize:], buf)
 
-	// fec data group
-	var cacheLine []byte
-	var fecGroup [][]byte
-	var fecCnt int
-	var fecMaxSize int
+	// FEC stage
 	if s.fec != nil {
-		cacheLine = make([]byte, s.fec.shardSize*mtuLimit)
-		fecGroup = make([][]byte, s.fec.shardSize)
-		for k := range fecGroup {
-			fecGroup[k] = cacheLine[k*mtuLimit : (k+1)*mtuLimit]
+		s.fec.markData(ext[s.fecHeaderOffset:])
+		binary.LittleEndian.PutUint16(ext[s.fecPayloadOffset:], uint16(len(ext[s.fecPayloadOffset:])))
+
+		// copy data to fec datashards
+		sz := len(ext)
+		s.fecDataShards[s.fecShardCount] = s.fecDataShards[s.fecShardCount][:sz]
+		copy(s.fecDataShards[s.fecShardCount], ext)
+		s.fecShardCount++
+
+		// record max datashard length
+		if sz > s.fecMaxSize {
+			s.fecMaxSize = sz
+		}
+
+		//  calculate Reed-Solomon Erasure Code
+		if s.fecShardCount == s.fec.dataShards {
+			// bzero each datashard's tail
+			for i := 0; i < s.fec.dataShards; i++ {
+				shard := s.fecDataShards[i]
+				slen := len(shard)
+				xorBytes(shard[slen:s.fecMaxSize], shard[slen:s.fecMaxSize], shard[slen:s.fecMaxSize])
+			}
+
+			// calculation of RS
+			ecc = s.fec.Encode(s.fecDataShards, s.fecPayloadOffset, s.fecMaxSize)
+			for k := range ecc {
+				s.fec.markFEC(ecc[k][s.fecHeaderOffset:])
+				ecc[k] = ecc[k][:s.fecMaxSize]
+			}
+
+			// reset counters to zero
+			s.fecShardCount = 0
+			s.fecMaxSize = 0
 		}
 	}
 
-	// keepalive
-	var lastPing time.Time
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	// encryption stage
+	if s.block != nil {
+		io.ReadFull(rand.Reader, ext[:nonceSize])
+		checksum := crc32.ChecksumIEEE(ext[cryptHeaderSize:])
+		binary.LittleEndian.PutUint32(ext[nonceSize:], checksum)
+		s.block.Encrypt(ext, ext)
 
-	for {
-		select {
-		case ext := <-s.chUDPOutput:
-			var ecc [][]byte
-			if s.fec != nil {
-				s.fec.markData(ext[fecOffset:])
-				// explicit size
-				binary.LittleEndian.PutUint16(ext[szOffset:], uint16(len(ext[szOffset:])))
-
-				// copy data to fec group
-				sz := len(ext)
-				fecGroup[fecCnt] = fecGroup[fecCnt][:sz]
-				copy(fecGroup[fecCnt], ext)
-				fecCnt++
-				if sz > fecMaxSize {
-					fecMaxSize = sz
-				}
-
-				//  calculate Reed-Solomon Erasure Code
-				if fecCnt == s.fec.dataShards {
-					for i := 0; i < s.fec.dataShards; i++ {
-						shard := fecGroup[i]
-						slen := len(shard)
-						xorBytes(shard[slen:fecMaxSize], shard[slen:fecMaxSize], shard[slen:fecMaxSize])
-					}
-					ecc = s.fec.calcECC(fecGroup, szOffset, fecMaxSize)
-					for k := range ecc {
-						s.fec.markFEC(ecc[k][fecOffset:])
-						ecc[k] = ecc[k][:fecMaxSize]
-					}
-					fecCnt = 0
-					fecMaxSize = 0
-				}
+		if ecc != nil {
+			for k := range ecc {
+				io.ReadFull(rand.Reader, ecc[k][:nonceSize])
+				checksum := crc32.ChecksumIEEE(ecc[k][cryptHeaderSize:])
+				binary.LittleEndian.PutUint32(ecc[k][nonceSize:], checksum)
+				s.block.Encrypt(ecc[k], ecc[k])
 			}
-
-			if s.block != nil {
-				io.ReadFull(rand.Reader, ext[:nonceSize])
-				checksum := crc32.ChecksumIEEE(ext[cryptHeaderSize:])
-				binary.LittleEndian.PutUint32(ext[nonceSize:], checksum)
-				s.block.Encrypt(ext, ext)
-
-				if ecc != nil {
-					for k := range ecc {
-						io.ReadFull(rand.Reader, ecc[k][:nonceSize])
-						checksum := crc32.ChecksumIEEE(ecc[k][cryptHeaderSize:])
-						binary.LittleEndian.PutUint32(ecc[k][nonceSize:], checksum)
-						s.block.Encrypt(ecc[k], ecc[k])
-					}
-				}
-			}
-
-			//if rand.Intn(100) < 80 {
-			if n, err := s.conn.WriteTo(ext, s.remote); err == nil {
-				atomic.AddUint64(&DefaultSnmp.OutSegs, 1)
-				atomic.AddUint64(&DefaultSnmp.OutBytes, uint64(n))
-			}
-			//}
-
-			if ecc != nil {
-				for k := range ecc {
-					if n, err := s.conn.WriteTo(ecc[k], s.remote); err == nil {
-						atomic.AddUint64(&DefaultSnmp.OutSegs, 1)
-						atomic.AddUint64(&DefaultSnmp.OutBytes, uint64(n))
-					}
-				}
-			}
-			xmitBuf.Put(ext)
-		case <-ticker.C: // NAT keep-alive
-			if len(s.chUDPOutput) == 0 {
-				s.mu.Lock()
-				interval := s.keepAliveInterval
-				s.mu.Unlock()
-				if interval > 0 && time.Now().After(lastPing.Add(interval)) {
-					var rnd uint16
-					binary.Read(rand.Reader, binary.LittleEndian, &rnd)
-					sz := int(rnd)%(IKCP_MTU_DEF-s.headerSize-IKCP_OVERHEAD) + s.headerSize + IKCP_OVERHEAD
-					ping := make([]byte, sz) // randomized ping packet
-					io.ReadFull(rand.Reader, ping)
-					s.conn.WriteTo(ping, s.remote)
-					lastPing = time.Now()
-				}
-			}
-		case <-s.die:
-			return
 		}
 	}
+
+	// WriteTo kernel
+	nbytes := 0
+	npkts := 0
+	// if mrand.Intn(100) < 50 {
+	if n, err := s.conn.WriteTo(ext, s.remote); err == nil {
+		nbytes += n
+		npkts++
+	}
+	// }
+
+	if ecc != nil {
+		for k := range ecc {
+			if n, err := s.conn.WriteTo(ecc[k], s.remote); err == nil {
+				nbytes += n
+				npkts++
+			}
+		}
+	}
+	atomic.AddUint64(&DefaultSnmp.OutPkts, uint64(npkts))
+	atomic.AddUint64(&DefaultSnmp.OutBytes, uint64(nbytes))
 }
 
-// kcp update, input loop
-func (s *UDPSession) updateTask() {
-	var tc <-chan time.Time
-	if s.l == nil { // client
-		ticker := time.NewTicker(10 * time.Millisecond)
-		tc = ticker.C
-		defer ticker.Stop()
-	} else {
-		tc = s.chTicker
+// kcp update, returns interval for next calling
+func (s *UDPSession) update() (interval time.Duration) {
+	s.mu.Lock()
+	s.kcp.flush(false)
+	if s.kcp.WaitSnd() < int(s.kcp.Cwnd()) {
+		s.notifyWriteEvent()
 	}
-
-	for {
-		select {
-		case <-tc:
-			s.mu.Lock()
-			current := currentMs()
-			s.kcp.Update(current)
-			if s.kcp.WaitSnd() < 2*int(s.kcp.snd_wnd) {
-				s.notifyWriteEvent()
-			}
-			s.mu.Unlock()
-		case <-s.die:
-			if s.l != nil { // has listener
-				select {
-				case s.l.chDeadlinks <- s.remote:
-				case <-s.l.die:
-				}
-			}
-			return
-		}
-	}
+	interval = s.updateInterval
+	s.mu.Unlock()
+	return
 }
 
 // GetConv gets conversation id of a session
@@ -549,59 +543,73 @@ func (s *UDPSession) notifyWriteEvent() {
 }
 
 func (s *UDPSession) kcpInput(data []byte) {
-	current := currentMs()
+	var kcpInErrors, fecErrs, fecRecovered, fecParityShards uint64
+
 	if s.fec != nil {
-		f := s.fec.decode(data)
+		f := s.fec.decodeBytes(data)
+		s.mu.Lock()
+		if f.flag == typeData {
+			if ret := s.kcp.Input(data[fecHeaderSizePlus2:], true, s.ackNoDelay); ret != 0 {
+				kcpInErrors++
+			}
+		}
+
 		if f.flag == typeData || f.flag == typeFEC {
 			if f.flag == typeFEC {
-				atomic.AddUint64(&DefaultSnmp.FECSegs, 1)
+				fecParityShards++
 			}
 
-			if recovers := s.fec.input(f); recovers != nil {
-				s.mu.Lock()
-				s.kcp.current = current
-				for k := range recovers {
-					sz := binary.LittleEndian.Uint16(recovers[k])
-					if int(sz) <= len(recovers[k]) && sz >= 2 {
-						if ret := s.kcp.Input(recovers[k][2:sz], false); ret != 0 {
-							atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
+			if recovers := s.fec.Decode(f); recovers != nil {
+				for _, r := range recovers {
+					if len(r) >= 2 { // must be larger than 2bytes
+						sz := binary.LittleEndian.Uint16(r)
+						if int(sz) <= len(r) && sz >= 2 {
+							if ret := s.kcp.Input(r[2:sz], false, s.ackNoDelay); ret == 0 {
+								fecRecovered++
+							} else {
+								kcpInErrors++
+							}
+						} else {
+							fecErrs++
 						}
 					} else {
-						atomic.AddUint64(&DefaultSnmp.FECErrs, 1)
+						fecErrs++
 					}
 				}
-				s.mu.Unlock()
-				atomic.AddUint64(&DefaultSnmp.FECRecovered, uint64(len(recovers)))
 			}
 		}
-		if f.flag == typeData {
-			s.mu.Lock()
-			s.kcp.current = current
-			if ret := s.kcp.Input(data[fecHeaderSizePlus2:], true); ret != 0 {
-				atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
-			}
-			s.mu.Unlock()
+
+		// notify reader
+		if n := s.kcp.PeekSize(); n > 0 {
+			s.notifyReadEvent()
 		}
+		s.mu.Unlock()
 	} else {
 		s.mu.Lock()
-		s.kcp.current = current
-		if ret := s.kcp.Input(data, true); ret != 0 {
-			atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
+		if ret := s.kcp.Input(data, true, s.ackNoDelay); ret != 0 {
+			kcpInErrors++
+		}
+		// notify reader
+		if n := s.kcp.PeekSize(); n > 0 {
+			s.notifyReadEvent()
 		}
 		s.mu.Unlock()
 	}
 
-	// notify reader
-	s.mu.Lock()
-	if n := s.kcp.PeekSize(); n > 0 {
-		s.notifyReadEvent()
+	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
+	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
+	if fecParityShards > 0 {
+		atomic.AddUint64(&DefaultSnmp.FECParityShards, fecParityShards)
 	}
-	if s.ackNoDelay {
-		s.kcp.current = current
-		s.kcp.flush()
+	if kcpInErrors > 0 {
+		atomic.AddUint64(&DefaultSnmp.KCPInErrors, kcpInErrors)
 	}
-	s.mu.Unlock()
-	atomic.AddUint64(&DefaultSnmp.InSegs, 1)
+	if fecErrs > 0 {
+		atomic.AddUint64(&DefaultSnmp.FECErrs, fecErrs)
+	}
+	if fecRecovered > 0 {
+		atomic.AddUint64(&DefaultSnmp.FECRecovered, fecRecovered)
+	}
 }
 
 func (s *UDPSession) receiver(ch chan []byte) {
@@ -622,7 +630,7 @@ func (s *UDPSession) receiver(ch chan []byte) {
 
 // read loop for client session
 func (s *UDPSession) readLoop() {
-	chPacket := make(chan []byte, txQueueLimit)
+	chPacket := make(chan []byte, 1)
 	go s.receiver(chPacket)
 
 	for {
@@ -657,21 +665,23 @@ func (s *UDPSession) readLoop() {
 type (
 	// Listener defines a server listening for connections
 	Listener struct {
-		block                    BlockCrypt
-		dataShards, parityShards int
-		fec                      *FEC // for fec init test
-		conn                     net.PacketConn
-		sessions                 map[string]*UDPSession
-		chAccepts                chan *UDPSession
-		chDeadlinks              chan net.Addr
-		headerSize               int
-		die                      chan struct{}
-		rxbuf                    sync.Pool
-		rd                       atomic.Value
-		wd                       atomic.Value
+		block        BlockCrypt     // block encryption
+		dataShards   int            // FEC data shard
+		parityShards int            // FEC parity shard
+		fec          *FEC           // FEC mock initialization
+		conn         net.PacketConn // the underlying packet connection
+
+		sessions    map[string]*UDPSession // all sessions accepted by this Listener
+		chAccepts   chan *UDPSession       // Listen() backlog
+		chDeadlinks chan net.Addr          // session close queue
+		headerSize  int                    // the overall header size added before KCP frame
+		die         chan struct{}          // notify the listener has closed
+		rd          atomic.Value           // read deadline for Accept()
+		wd          atomic.Value
 	}
 
-	packet struct {
+	// incoming packet
+	inPacket struct {
 		from net.Addr
 		data []byte
 	}
@@ -679,10 +689,8 @@ type (
 
 // monitor incoming data for all connections of server
 func (l *Listener) monitor() {
-	chPacket := make(chan packet, txQueueLimit)
+	chPacket := make(chan inPacket, 1)
 	go l.receiver(chPacket)
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
 	for {
 		select {
 		case p := <-chPacket:
@@ -732,28 +740,23 @@ func (l *Listener) monitor() {
 				}
 			}
 
-			l.rxbuf.Put(raw)
+			xmitBuf.Put(raw)
 		case deadlink := <-l.chDeadlinks:
 			delete(l.sessions, deadlink.String())
 		case <-l.die:
 			return
-		case <-ticker.C:
-			now := time.Now()
-			for _, s := range l.sessions {
-				select {
-				case s.chTicker <- now:
-				default:
-				}
-			}
 		}
 	}
 }
 
-func (l *Listener) receiver(ch chan packet) {
+func (l *Listener) receiver(ch chan inPacket) {
 	for {
-		data := l.rxbuf.Get().([]byte)[:mtuLimit]
+		data := xmitBuf.Get().([]byte)[:mtuLimit]
 		if n, from, err := l.conn.ReadFrom(data); err == nil && n >= l.headerSize+IKCP_OVERHEAD {
-			ch <- packet{from, data[:n]}
+			select {
+			case ch <- inPacket{from, data[:n]}:
+			case <-l.die:
+			}
 		} else if err != nil {
 			return
 		} else {
@@ -767,7 +770,7 @@ func (l *Listener) SetReadBuffer(bytes int) error {
 	if nc, ok := l.conn.(setReadBuffer); ok {
 		return nc.SetReadBuffer(bytes)
 	}
-	return nil
+	return errors.New(errInvalidOperation)
 }
 
 // SetWriteBuffer sets the socket write buffer for the Listener
@@ -775,7 +778,7 @@ func (l *Listener) SetWriteBuffer(bytes int) error {
 	if nc, ok := l.conn.(setWriteBuffer); ok {
 		return nc.SetWriteBuffer(bytes)
 	}
-	return nil
+	return errors.New(errInvalidOperation)
 }
 
 // SetDSCP sets the 6bit DSCP field of IP header
@@ -783,7 +786,7 @@ func (l *Listener) SetDSCP(dscp int) error {
 	if nc, ok := l.conn.(net.Conn); ok {
 		return ipv4.NewConn(nc).SetTOS(dscp << 2)
 	}
-	return nil
+	return errors.New(errInvalidOperation)
 }
 
 // Accept implements the Accept method in the Listener interface; it waits for the next call and returns a generic Conn.
@@ -870,9 +873,6 @@ func ServeConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketCo
 	l.parityShards = parityShards
 	l.block = block
 	l.fec = newFEC(rxFECMulti*(dataShards+parityShards), dataShards, parityShards)
-	l.rxbuf.New = func() interface{} {
-		return make([]byte, mtuLimit)
-	}
 
 	// calculate header size
 	if l.block != nil {
